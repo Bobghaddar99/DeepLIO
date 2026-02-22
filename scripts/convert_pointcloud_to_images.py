@@ -6,6 +6,9 @@ spherical range image, and the resulting vertex (x, y, z coordinates) and
 surface-normal images are saved as NumPy arrays (.npy).  Optionally a PNG
 visualisation is written alongside each .npy file.
 
+This script is fully self-contained and requires only NumPy (and Pillow when
+``--save-png`` is used).  No other packages or local project imports are needed.
+
 Usage
 -----
     python convert_pointcloud_to_images.py -i <file_or_dir> [<file_or_dir> ...]
@@ -35,15 +38,150 @@ When ``--save-png`` is given, additional PNG visualisations are saved:
 import argparse
 import glob
 import os
-import sys
 
 import numpy as np
 
-dname = os.path.dirname(os.path.realpath(__file__))
-content_dir = os.path.abspath("{}/..".format(dname))
-sys.path.insert(0, content_dir)
 
-from deeplio.common.laserscan import LaserScan  # noqa: E402
+# ---------------------------------------------------------------------------
+# Supported file extensions
+# ---------------------------------------------------------------------------
+
+EXTENSIONS_SCAN = ['.bin', '.txt', '.npy']
+
+
+# ---------------------------------------------------------------------------
+# Point-cloud file loaders
+# ---------------------------------------------------------------------------
+
+def _load_velo_scan(filename):
+    """Load a Velodyne scan file and return an (N, 4) float32 array (x,y,z,r)."""
+    if filename.endswith('.bin'):
+        scan = np.fromfile(filename, dtype=np.float32).reshape(-1, 4)
+    elif filename.endswith('.npy'):
+        scan = np.load(filename).astype(np.float32)
+    elif filename.endswith('.txt'):
+        scan = np.genfromtxt(filename, dtype=np.float32)
+    else:
+        raise RuntimeError("Unsupported file extension: {}".format(filename))
+    return scan
+
+
+# ---------------------------------------------------------------------------
+# Spherical range projection
+# ---------------------------------------------------------------------------
+
+def _range_projection(points, remissions, H, W, fov_up, fov_down, min_depth, max_depth):
+    """Project 3-D points into a spherical range image.
+
+    Parameters
+    ----------
+    points : ndarray, shape (N, 3)
+    remissions : ndarray, shape (N,)
+    H, W : int – image height / width
+    fov_up, fov_down : float – vertical FOV limits in **degrees**
+    min_depth, max_depth : float – depth clipping range in metres
+
+    Returns
+    -------
+    proj_xyz : ndarray, shape (H, W, 3)  – vertex image
+    proj_range : ndarray, shape (H, W)   – range image
+    proj_remission : ndarray, shape (H, W)
+    """
+    fov_up_rad = fov_up / 180.0 * np.pi
+    fov_down_rad = fov_down / 180.0 * np.pi
+    fov = abs(fov_down_rad) + abs(fov_up_rad)
+
+    depth = np.linalg.norm(points, 2, axis=1)
+
+    # Filter points outside the depth range
+    valid = (depth >= min_depth) & (depth <= max_depth)
+    points = points[valid]
+    remissions = remissions[valid]
+    depth = depth[valid]
+
+    scan_x, scan_y, scan_z = points[:, 0], points[:, 1], points[:, 2]
+
+    yaw = -np.arctan2(scan_y, scan_x)
+    pitch = np.arcsin(scan_z / depth)
+
+    proj_x = 0.5 * (yaw / np.pi + 1.0) * W
+    proj_y = (1.0 - (pitch + abs(fov_down_rad)) / fov) * H
+
+    proj_x = np.clip(np.floor(proj_x).astype(np.int32), 0, W - 1)
+    proj_y = np.clip(np.floor(proj_y).astype(np.int32), 0, H - 1)
+
+    # Paint in decreasing-depth order so closer points overwrite farther ones
+    order = np.argsort(depth)[::-1]
+    depth = depth[order]
+    points = points[order]
+    remissions = remissions[order]
+    proj_x = proj_x[order]
+    proj_y = proj_y[order]
+
+    proj_xyz = np.zeros((H, W, 3), dtype=np.float32)
+    proj_range = np.zeros((H, W), dtype=np.float32)
+    proj_remission = np.zeros((H, W), dtype=np.float32)
+
+    proj_range[proj_y, proj_x] = depth
+    proj_xyz[proj_y, proj_x] = points
+    proj_remission[proj_y, proj_x] = remissions
+
+    return proj_xyz, proj_range, proj_remission
+
+
+# ---------------------------------------------------------------------------
+# Normal estimation
+# ---------------------------------------------------------------------------
+
+def _normal_projection(proj_xyz, proj_range):
+    """Compute a surface-normal image from a vertex + range image.
+
+    Uses weighted cross-products of 4 neighbouring difference vectors.
+
+    Parameters
+    ----------
+    proj_xyz : ndarray, shape (H, W, 3)
+    proj_range : ndarray, shape (H, W)
+
+    Returns
+    -------
+    proj_normal : ndarray, shape (H, W, 3) – unit-length normals
+    """
+    img = np.dstack((proj_xyz, proj_range))
+
+    def calc_weights(x, alpha=-0.8):
+        return np.exp(alpha * np.abs(x))
+
+    diff_vertical = img[:-1, :, :] - img[1:, :, :]
+    diff_horizontal = img[:, :-1, :] - img[:, 1:, :]
+
+    x_diff_top = diff_vertical[:-1, 1:-1, :]
+    x_diff_bottom = -diff_vertical[1:, 1:-1, :]
+    x_diff_left = diff_horizontal[1:-1, :-1, :]
+    x_diff_right = -diff_horizontal[1:-1, 1:, :]
+
+    x_range_diffs = np.stack(
+        (x_diff_top[:, :, -1], x_diff_left[:, :, -1],
+         x_diff_bottom[:, :, -1], x_diff_right[:, :, -1]),
+        axis=2,
+    )
+    weights = calc_weights(x_range_diffs)
+
+    x_norm_tl = np.cross(weights[..., 0:1] * x_diff_top[..., :3],
+                         weights[..., 1:2] * x_diff_left[..., :3])
+    x_norm_lb = np.cross(weights[..., 1, None] * x_diff_left[..., :3],
+                         weights[..., 2, None] * x_diff_bottom[..., :3])
+    x_norm_br = np.cross(weights[..., 2, None] * x_diff_bottom[..., :3],
+                         weights[..., 3, None] * x_diff_right[..., :3])
+    x_norm_rt = np.cross(weights[..., 3, None] * x_diff_right[..., :3],
+                         weights[..., 0, None] * x_diff_top[..., :3])
+
+    proj_normal = np.sum(
+        np.stack((x_norm_tl, x_norm_lb, x_norm_br, x_norm_rt)), axis=0
+    )
+    proj_normal /= (np.linalg.norm(proj_normal, axis=2, keepdims=True) + 1e-8)
+    proj_normal = np.pad(proj_normal, ((1, 1), (1, 1), (0, 0)))
+    return proj_normal
 
 
 # ---------------------------------------------------------------------------
@@ -54,15 +192,15 @@ def _collect_scan_files(paths):
     """Return a sorted list of point-cloud file paths from *paths*.
 
     Each entry in *paths* may be a single file or a directory.  Directories
-    are searched (non-recursively) for files with the extensions supported by
-    :class:`~deeplio.common.laserscan.LaserScan`.
+    are searched (non-recursively) for files whose extension is in
+    ``EXTENSIONS_SCAN``.
     """
     files = []
     for p in paths:
         if os.path.isfile(p):
             files.append(p)
         elif os.path.isdir(p):
-            for ext in LaserScan.EXTENSIONS_SCAN:
+            for ext in EXTENSIONS_SCAN:
                 files.extend(glob.glob(os.path.join(p, "*{}".format(ext))))
         else:
             raise FileNotFoundError("Path not found: {}".format(p))
@@ -81,7 +219,8 @@ def _save_png(array, path):
 # Core conversion
 # ---------------------------------------------------------------------------
 
-def convert_scan(scan_file, output_dir, scanner, save_png=False):
+def convert_scan(scan_file, output_dir, H, W, fov_up, fov_down,
+                 min_depth, max_depth, save_png=False):
     """Project one LiDAR scan file and write vertex / normal images.
 
     Parameters
@@ -90,37 +229,40 @@ def convert_scan(scan_file, output_dir, scanner, save_png=False):
         Path to the input point-cloud file (.bin, .npy, or .txt).
     output_dir : str
         Directory where output files will be written.
-    scanner : LaserScan
-        Configured :class:`~deeplio.common.laserscan.LaserScan` instance (will
-        be reused across calls for efficiency).
+    H, W : int – projection image height / width
+    fov_up, fov_down : float – vertical FOV in degrees
+    min_depth, max_depth : float – depth clipping in metres
     save_png : bool
         When ``True``, also write PNG visualisations.
     """
-    scanner.open_scan(scan_file)
-    scanner.do_range_projection()
-    scanner.do_normal_projection()
+    scan = _load_velo_scan(scan_file)
+    points = scan[:, :3]
+    remissions = scan[:, 3] if scan.shape[1] > 3 else np.zeros(len(scan), dtype=np.float32)
+
+    proj_xyz, proj_range, _ = _range_projection(
+        points, remissions, H, W, fov_up, fov_down, min_depth, max_depth
+    )
+    proj_normal = _normal_projection(proj_xyz, proj_range)
 
     base = os.path.splitext(os.path.basename(scan_file))[0]
 
     # --- vertex image (H, W, 3) ---
-    vertex_img = scanner.proj_xyz.astype(np.float32)
     vertex_path = os.path.join(output_dir, "{}_vertex.npy".format(base))
-    np.save(vertex_path, vertex_img)
+    np.save(vertex_path, proj_xyz)
 
     # --- normal image (H, W, 3) ---
-    normal_img = scanner.proj_normal.astype(np.float32)
     normal_path = os.path.join(output_dir, "{}_normal.npy".format(base))
-    np.save(normal_path, normal_img)
+    np.save(normal_path, proj_normal)
 
     if save_png:
         # Vertex: map absolute values to [0, 1]
-        v_abs = np.abs(vertex_img)
+        v_abs = np.abs(proj_xyz)
         v_max = v_abs.max()
         v_vis = v_abs / v_max if v_max > 0 else v_abs
         _save_png(v_vis, os.path.join(output_dir, "{}_vertex.png".format(base)))
 
         # Normal: map from [-1, 1] to [0, 1]
-        n_vis = (normal_img + 1.0) / 2.0
+        n_vis = (proj_normal + 1.0) / 2.0
         _save_png(n_vis, os.path.join(output_dir, "{}_normal.png".format(base)))
 
     return vertex_path, normal_path
@@ -139,20 +281,18 @@ def main(args):
 
     os.makedirs(args["output"], exist_ok=True)
 
-    scanner = LaserScan(
-        project=False,
-        H=args["H"],
-        W=args["W"],
-        fov_up=args["fov_up"],
-        fov_down=args["fov_down"],
-        min_depth=args["min_depth"],
-        max_depth=args["max_depth"],
-    )
-
     print("Converting {} scan file(s) → {}".format(len(scan_files), args["output"]))
     for scan_file in scan_files:
         vertex_path, normal_path = convert_scan(
-            scan_file, args["output"], scanner, save_png=args["save_png"]
+            scan_file,
+            args["output"],
+            H=args["H"],
+            W=args["W"],
+            fov_up=args["fov_up"],
+            fov_down=args["fov_down"],
+            min_depth=args["min_depth"],
+            max_depth=args["max_depth"],
+            save_png=args["save_png"],
         )
         print("  {} → vertex: {}, normal: {}".format(
             os.path.basename(scan_file),
